@@ -1,118 +1,148 @@
 #include <MCUFRIEND_kbv.h>
 #include <Arduino.h>
 #include <SensirionI2CScd4x.h>
+#include <SensirionI2CSen5x.h>
 #include <Wire.h>
+#include "displays/display.h"
 
-
-MCUFRIEND_kbv tft;
 SensirionI2CScd4x scd4x;
+SensirionI2CSen5x sen5x;
+MCUFRIEND_kbv tft;
 
-// Assign human-readable names to some common 16-bit color values:
-#define BLACK   0x0000
-#define BLUE    0x001F
-#define RED     0xF800
-#define GREEN   0x07E0
-#define CYAN    0x07FF
-#define MAGENTA 0xF81F
-#define YELLOW  0xFFE0
-#define WHITE   0xFFFF
-#define GRAY    0x8410
-
-struct dataTuple {
-    uint16_t co2;
-    float temperature;
-    float humidity;
-    long timestampMicro;
-};
 
 uint16_t version = MCUFRIEND_KBV_H_;
 const uint16_t ArrayLength = 100;
 size_t ArrayIndex = 0;
-//uint16_t prevCo2ArrayIndex = (ArrayIndex - 1 + ArrayLength) % ArrayLength;
-struct dataTuple df[ArrayLength] = {0};
+// uint16_t prevCo2ArrayIndex = (ArrayIndex - 1 + ArrayLength) % ArrayLength;
+struct airQualityDataPoint df[ArrayLength] = {0};
 
-
-bool data_is_ready(){
-    bool isDataReady = false;
-    uint16_t error;
-    error = scd4x.getDataReadyFlag(isDataReady);
-    if (error) {
-        Serial.print("Error trying to execute getDataReadyFlag()");
+bool dataIsReady()
+{
+    bool isDataReadySCD41 = false;
+    uint16_t errorSCD41;
+    bool isDataReadySen55 = false;
+    uint16_t errorSen55;
+    errorSCD41 = scd4x.getDataReadyFlag(isDataReadySCD41);
+    errorSen55 = sen5x.readDataReady(isDataReadySen55);
+    if (errorSCD41 || errorSen55)
+    {
+        Serial.print("Error trying to retrieve data ready flag: ");
+        Serial.print("errorSCD41: ");
+        Serial.print(errorSCD41);
+        Serial.print(" errorSen55: ");
+        Serial.println(errorSen55);
         return false;
     }
-    if (!isDataReady) {
-        Serial.print("Data not ready yet");
-    }
-    return isDataReady;
+    return isDataReadySen55 && isDataReadySCD41;
 }
 
-int read_data(uint16_t &co2, float &temperature, float &humidity){
-    if (data_is_ready()){
-        scd4x.readMeasurement(co2, temperature, humidity);
-        return 0;
-    }
-    return 1;
-}
-
-int update_dataframe(){
-    uint16_t co2 = 0;
-    float temperature = 0.0f;
-    float humidity = 0.0f;
-    uint16_t error;
-    Serial.println("Trying to read data.");
-    error = read_data(co2, temperature, humidity);
-    if (error) {
+int read_data(airQualityDataPoint &tuple)
+{
+    if (!dataIsReady())
+    {
         return 1;
     }
+    // SCD41 variables
+    uint16_t co2;
+    float temperatureSCD41;
+    float humiditySCD41;
+    uint16_t errorSCD41;
 
-    ArrayIndex = (ArrayIndex + 1) % ArrayLength;
-    df[ArrayIndex].co2 = co2;
-    df[ArrayIndex].temperature = temperature;
-    df[ArrayIndex].humidity = humidity;
+    // Sen55 variables
+    float massConcentrationPm1p0;
+    float massConcentrationPm2p5;
+    float massConcentrationPm4p0;
+    float massConcentrationPm10p0;
+    float humiditySen55;
+    float temperatureSen55;
+    float vocIndex;
+    float noxIndex;
+    uint16_t errorSen55;
+
+    errorSen55 = sen5x.readMeasuredValues(
+        massConcentrationPm1p0, massConcentrationPm2p5, massConcentrationPm4p0,
+        massConcentrationPm10p0, humiditySen55, temperatureSen55, vocIndex,
+        noxIndex);
+    errorSCD41 = scd4x.readMeasurement(co2, temperatureSCD41, humiditySCD41);
+    if (errorSCD41 || errorSen55)
+    {
+        Serial.print("Error trying to read measurements from sensors: ");
+        Serial.print("errorSCD41: ");
+        Serial.print(errorSCD41);
+        Serial.println("errorSen55: ");
+        Serial.print(errorSen55);
+        return 2;
+    }
+
+    tuple.co2 = co2;
+    tuple.temperature = (temperatureSCD41 + temperatureSen55) / 2;
+    tuple.humidity = (humiditySCD41 + humiditySen55) / 2;
+    tuple.massConcentrationPm1p0 = massConcentrationPm1p0;
+    tuple.massConcentrationPm2p5 = massConcentrationPm2p5;
+    tuple.massConcentrationPm4p0 = massConcentrationPm4p0;
+    tuple.massConcentrationPm10p0 = massConcentrationPm10p0;
+    tuple.vocIndex = vocIndex;
+    tuple.noxIndex = noxIndex;
+
+    return 0;
+}
+
+int updateairQualityDataPoint(airQualityDataPoint &tuple)
+{
+    uint16_t error;
+    error = read_data(tuple);
+    if (error)
+    {
+        return 1;
+    }
     return 0;
 }
 
 void setup()
 {
     Serial.begin(115200);
-        while (!Serial) {
+    while (!Serial)
+    {
         delay(100);
     }
     Wire.begin();
+
     scd4x.begin(Wire);
     scd4x.startPeriodicMeasurement();
-    uint16_t ID = tft.readID();
-    tft.reset();
-    tft.begin(ID);
-    tft.setRotation(3);  // "PORTRAIT", "LANDSCAPE", "PORTRAIT_REV", "LANDSCAPE_REV"
-    tft.fillScreen(BLACK);
-    tft.print("Waiting for first measurement...");
-    while (!data_is_ready()){
+
+    sen5x.begin(Wire);
+    sen5x.deviceReset();
+    sen5x.startMeasurement();
+
+    tft = initLCD(tft, 3, BLACK, WHITE);
+
+    while (!dataIsReady())
+    {
         delay(5000);
     }
 }
 
-
 void loop()
 {
-    update_dataframe();
+    airQualityDataPoint tuple = df[ArrayIndex];
+    uint16_t error;
+    error = updateairQualityDataPoint(tuple);
+    if (error){
+        delay(5000);
+    }
+    df[ArrayIndex] = tuple;
+    ArrayIndex = (ArrayIndex + 1) % ArrayLength;
 
     Serial.print("Co2:");
-    Serial.print(df[ArrayIndex].co2);
+    Serial.print(tuple.co2);
     Serial.print("\t");
     Serial.print("Temperature:");
-    Serial.print(df[ArrayIndex].temperature);
+    Serial.print(tuple.temperature);
     Serial.print("\t");
     Serial.print("Humidity:");
-    Serial.println(df[ArrayIndex].humidity);
+    Serial.println(tuple.humidity);
 
-    tft.fillScreen(BLACK);
-    tft.setTextSize(2);
-    tft.setTextColor(WHITE);
-    tft.setCursor(40, 40);
-    tft.print("C02: ");
-    tft.print(df[ArrayIndex].co2);
-    tft.println("ppm");
+    printAirQualityDataPoint(tft, tuple, BLACK, WHITE);
 
     delay(20000);
 }
